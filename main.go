@@ -57,7 +57,7 @@ var (
 
 // 思考内容处理策略
 const (
-	THINK_TAGS_MODE = "strip" // strip: 去除<details>标签；think: 转为<think>标签；raw: 保留原样
+	THINK_TAGS_MODE = "think" // strip: 去除<details>标签；think: 转为<think>标签；raw: 保留原样
 )
 
 // 伪装前端头部（来自抓包）
@@ -197,6 +197,55 @@ func getClientIP(r *http.Request) string {
 		ip = strings.Split(ip, ":")[0]
 	}
 	return ip
+}
+
+// 管理思考标签中的工具调用
+// 当检测到<tool_use>标签时，在工具调用前后插入适当的</think>和<think>标签
+func manageThinkTagsForToolCalls(content string) string {
+	// 如果没有工具调用，直接返回原内容
+	if !strings.Contains(content, "<tool_use>") {
+		return content
+	}
+	
+	// 使用正则表达式找到所有工具调用标签
+	toolUseRegex := regexp.MustCompile(`<tool_use>.*?</tool_use>`)
+	matches := toolUseRegex.FindAllStringIndex(content, -1)
+	
+	if len(matches) == 0 {
+		return content
+	}
+	
+	var result strings.Builder
+	lastEnd := 0
+	
+	for _, match := range matches {
+		start, end := match[0], match[1]
+		
+		// 添加工具调用之前的内容
+		beforeTool := content[lastEnd:start]
+		if beforeTool != "" {
+			result.WriteString(beforeTool)
+			// 在工具调用之前闭合<think>标签
+			result.WriteString("</think>")
+		}
+		
+		// 添加工具调用本身
+		toolCall := content[start:end]
+		result.WriteString(toolCall)
+		
+		// 在工具调用之后重新开启<think>标签
+		result.WriteString("<think>")
+		
+		lastEnd = end
+	}
+	
+	// 添加最后一个工具调用之后的内容
+	if lastEnd < len(content) {
+		remaining := content[lastEnd:]
+		result.WriteString(remaining)
+	}
+	
+	return result.String()
 }
 
 // OpenAI 请求结构
@@ -1345,16 +1394,100 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析请求
-	var req OpenAIRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	// 解析请求，支持工具调用等现代格式
+	var flexReq struct {
+		Model       string                   `json:"model"`
+		Messages    []map[string]interface{} `json:"messages"`
+		Stream      bool                     `json:"stream,omitempty"`
+		Temperature float64                  `json:"temperature,omitempty"`
+		MaxTokens   int                      `json:"max_tokens,omitempty"`
+	}
+
+	if err := json.Unmarshal(body, &flexReq); err != nil {
 		debugLog("JSON解析失败: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		// 记录请求统计
 		duration := time.Since(startTime)
 		recordRequestStats(startTime, path, http.StatusBadRequest)
 		addLiveRequest(r.Method, path, http.StatusBadRequest, duration, "", userAgent)
 		return
+	}
+
+	// 处理消息，将非标准字段格式化为文本并附加到内容中
+	var processedMessages []Message
+	for _, msgMap := range flexReq.Messages {
+		role, _ := msgMap["role"].(string)
+
+		// 处理 content，它可能是字符串、null或复杂类型
+		var content string
+		if c, ok := msgMap["content"]; ok && c != nil {
+			if cStr, isString := c.(string); isString {
+				content = cStr
+			} else {
+				// 如果不是字符串，则格式化为JSON
+				contentBytes, err := json.MarshalIndent(c, "", "  ")
+				if err == nil {
+					content = string(contentBytes)
+				}
+			}
+		}
+
+		var extraParts []string
+
+		// 检查 tool_calls 并转换为上游期望的 <tool_use> XML格式
+		if toolCalls, ok := msgMap["tool_calls"].([]interface{}); ok && role == "assistant" {
+			var toolUseStrings []string
+			for _, toolCall := range toolCalls {
+				if tcMap, ok := toolCall.(map[string]interface{}); ok {
+					// 解析标准的OpenAI tool_calls结构
+					if function, ok := tcMap["function"].(map[string]interface{}); ok {
+						name, nameOk := function["name"].(string)
+						args, argsOk := function["arguments"].(string)
+						if nameOk && argsOk {
+							// 构建上游服务自定义的XML格式
+							toolUseStrings = append(toolUseStrings, fmt.Sprintf("<tool_use><name>%s</name><arguments>%s</arguments></tool_use>", name, args))
+						}
+					}
+				}
+			}
+			if len(toolUseStrings) > 0 {
+				// 将所有工具调用XML块合并
+				extraParts = append(extraParts, strings.Join(toolUseStrings, "\n"))
+			}
+		}
+
+		// 检查并格式化 tool_call_id (用于 'tool' 角色的消息)
+		if toolCallID, ok := msgMap["tool_call_id"]; ok {
+			if idStr, isString := toolCallID.(string); isString {
+				extraParts = append(extraParts, fmt.Sprintf("工具调用ID: %s", idStr))
+			}
+
+		}
+
+		// 组合最终内容
+		finalContent := content
+		if len(extraParts) > 0 {
+			// 如果原始内容不为空，则添加分隔符
+			if finalContent != "" {
+				finalContent += "\n\n"
+			}
+			finalContent += strings.Join(extraParts, "\n")
+		}
+
+		processedMessages = append(processedMessages, Message{Role: role, Content: finalContent})
+	}
+
+	// 构造标准的OpenAIRequest以供后续处理
+	req := OpenAIRequest{
+		Model:       flexReq.Model,
+		Messages:    processedMessages,
+		Stream:      flexReq.Stream,
+		Temperature: flexReq.Temperature,
+		MaxTokens:   flexReq.MaxTokens,
+	}
+
+	if DEBUG_MODE {
+		processedMessagesJSON, _ := json.MarshalIndent(req.Messages, "", "  ")
+		debugLog("处理后的消息:\n%s", string(processedMessagesJSON))
 	}
 
 	// 如果客户端没有明确指定stream参数，使用默认值
@@ -1504,6 +1637,8 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 		case "think":
 			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
 			s = strings.ReplaceAll(s, "</details>", "</think>")
+			// 检测工具调用并管理<think>标签
+			s = manageThinkTagsForToolCalls(s)
 		case "strip":
 			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
 			s = strings.ReplaceAll(s, "</details>", "")
@@ -1545,6 +1680,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 	debugLog("开始读取上游SSE流")
 	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
+	
+	// 用于检测<think>标签状态
+	var thinkTagOpen bool
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1599,7 +1737,30 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 			var out = upstreamData.Data.DeltaContent
 			if upstreamData.Data.Phase == "thinking" {
 				out = transformThinking(out)
+				// 检查thinking阶段是否开启了<think>标签
+				if strings.Contains(out, "<think>") {
+					thinkTagOpen = true
+				}
 			}
+			
+			// 检测工具调用开始
+			if strings.Contains(out, "<tool_use>") {
+				// 如果当前有<think>标签开启，需要先闭合
+				if thinkTagOpen {
+					out = "</think>" + out
+					thinkTagOpen = false
+				}
+			}
+			
+			// 检测工具调用结束
+			if strings.Contains(out, "</tool_use>") {
+				// 工具调用结束后，如果之前有<think>标签，重新开启
+				if !thinkTagOpen {
+					out = out + "<think>"
+					thinkTagOpen = true
+				}
+			}
+			
 			if out != "" {
 				debugLog("发送内容(%s): %s", upstreamData.Data.Phase, out)
 				chunk := OpenAIResponse{
@@ -1727,6 +1888,8 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 					case "think":
 						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
 						s = strings.ReplaceAll(s, "</details>", "</think>")
+						// 检测工具调用并管理<think>标签
+						s = manageThinkTagsForToolCalls(s)
 					case "strip":
 						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
 						s = strings.ReplaceAll(s, "</details>", "")
@@ -1782,3 +1945,4 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 	recordRequestStats(startTime, path, http.StatusOK)
 	addLiveRequest("POST", path, http.StatusOK, duration, "", userAgent)
 }
+
